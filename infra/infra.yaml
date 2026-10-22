@@ -1,0 +1,527 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Per-user S3 Files isolation on AgentCore Runtime (reference architecture).
+  Cognito login -> AgentCore Runtime (JWT authorizer) -> in-container root
+  gateway asks the broker Lambda for per-user STS credentials scoped to the
+  user's own S3 Files access point, mounts it, and serves a non-root agent.
+  The runtime execution role has ZERO S3 / S3 Files permissions.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet::Id
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet::Id
+  RuntimeName:
+    Type: String
+    Default: s3files_user_agent
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]{0,47}$'
+  ImageUri:
+    Type: String
+    Default: ''
+    Description: Agent container image. Leave empty on the first deploy (the runtime is created once an image exists).
+  ModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-6
+  PosixUid:
+    Type: Number
+    Default: 1000
+    Description: POSIX uid/gid enforced by every user access point; the agent process runs as this uid.
+
+Conditions:
+  HasImage: !Not [!Equals [!Ref ImageUri, '']]
+
+Resources:
+  # ------------------------------------------------------------------
+  # Network: one SG shared by the runtime ENIs and the mount targets.
+  # Only NFS (2049) from itself; no ingress from anywhere else.
+  # ------------------------------------------------------------------
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: AgentCore Runtime + S3 Files mount targets (NFS 2049 self-ingress only)
+      VpcId: !Ref VpcId
+
+  SecurityGroupSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !Ref SecurityGroup
+
+  # ------------------------------------------------------------------
+  # Data: one bucket, exposed as one S3 Files file system. Each user
+  # sees only /users/<sha256(sub)> through their own access point.
+  # ------------------------------------------------------------------
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Service role S3 Files uses to sync the file system with the bucket.
+  S3FilesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: elasticfilesystem.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3files:${AWS::Region}:${AWS::AccountId}:file-system/*"
+      Policies:
+        - PolicyName: S3BucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource: !GetAtt DataBucket.Arn
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref AWS::AccountId
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:DeleteObject*
+                  - s3:GetObject*
+                  - s3:List*
+                  - s3:PutObject*
+                Resource: !Sub "${DataBucket.Arn}/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref AWS::AccountId
+              - Effect: Allow
+                Action:
+                  - events:DeleteRule
+                  - events:DisableRule
+                  - events:EnableRule
+                  - events:PutRule
+                  - events:PutTargets
+                  - events:RemoveTargets
+                Condition:
+                  StringEquals:
+                    events:ManagedBy: elasticfilesystem.amazonaws.com
+                Resource:
+                  - "arn:aws:events:*:*:rule/DO-NOT-DELETE-S3-Files*"
+              - Effect: Allow
+                Action:
+                  - events:DescribeRule
+                  - events:ListRuleNamesByTarget
+                  - events:ListRules
+                  - events:ListTargetsByRule
+                Resource:
+                  - "arn:aws:events:*:*:rule/*"
+
+  S3FileSystem:
+    Type: AWS::S3Files::FileSystem
+    Properties:
+      Bucket: !GetAtt DataBucket.Arn
+      RoleArn: !GetAtt S3FilesRole.Arn
+
+  # Backstop: nobody may mount the file system without going through an
+  # access point. A resource-policy Deny beats any identity-policy Allow,
+  # so even a mis-granted role cannot mount the root and see every user.
+  FileSystemPolicy:
+    Type: AWS::S3Files::FileSystemPolicy
+    Properties:
+      FileSystemId: !Ref S3FileSystem
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyMountWithoutAccessPoint
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - s3files:ClientMount
+              - s3files:ClientWrite
+              - s3files:ClientRootAccess
+            Condition:
+              "Null":
+                s3files:AccessPointArn: "true"
+
+  MountTargetA:
+    Type: AWS::S3Files::MountTarget
+    Properties:
+      FileSystemId: !Ref S3FileSystem
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroups: [!Ref SecurityGroup]
+
+  MountTargetB:
+    Type: AWS::S3Files::MountTarget
+    Properties:
+      FileSystemId: !Ref S3FileSystem
+      SubnetId: !Ref PrivateSubnetB
+      SecurityGroups: [!Ref SecurityGroup]
+
+  # ------------------------------------------------------------------
+  # Login: Cognito user pool. Admin-created users only (no self sign-up).
+  # The browser sends the ACCESS token to the runtime (AllowedClients).
+  # ------------------------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-users"
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      UsernameConfiguration:
+        CaseSensitive: false
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "${AWS::StackName}-web"
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 1
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+
+  # ------------------------------------------------------------------
+  # User -> access point mapping, written ONLY by the onboarding control
+  # plane (scripts/manage_users.py, playing the upstream onboarding system) when a
+  # user is created; the broker only reads it.
+  #   PK sub -> username, userKey, fileSystemId, accessPointId, rootPath,
+  #             posixUid, posixGid, status (active|disabled), createdAt
+  # ------------------------------------------------------------------
+  UserStorageTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-user-storage"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: sub
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sub
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+
+  # ------------------------------------------------------------------
+  # Credential broker (Lambda code is deployed by scripts/deploy.sh).
+  #
+  # BrokerRole: verifies the user's Cognito token, looks up the user's
+  # access point in the mapping table, and assumes SessionMountRole with
+  # a session policy narrowed to that ONE access point.
+  # ------------------------------------------------------------------
+  BrokerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-broker-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: broker
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-broker*"
+              # Read-only lookup: the broker never creates access points.
+              - Sid: LookupUserMapping
+                Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !GetAtt UserStorageTable.Arn
+              - Sid: MintScopedMountCreds
+                Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !GetAtt SessionMountRole.Arn
+
+  # The only identity that can mount the file system. Its full-power
+  # credentials never leave the broker; microVMs only ever receive the
+  # session-policy-narrowed copy (max 1 h: STS role chaining limit).
+  SessionMountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-mount-role"
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:PrincipalArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-broker-role"
+      Policies:
+        - PolicyName: S3FilesMountBase
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Mount via ANY access point of this file system; narrowed to
+              # a single access point by the broker's STS session policy.
+              - Effect: Allow
+                Action:
+                  - s3files:ClientMount
+                  - s3files:ClientWrite
+                Resource: !Sub "arn:aws:s3files:${AWS::Region}:${AWS::AccountId}:file-system/${S3FileSystem.FileSystemId}"
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                  - elasticfilesystem:DescribeMountTargets
+                Resource: "*"
+              # Deliberately NO s3:GetObject: mounts use -o nodirects3read,
+              # so all data flows through the NFS path authorized above.
+
+  # ------------------------------------------------------------------
+  # Runtime execution role. Shared by every microVM, readable by any code
+  # in the VM (MMDS), so it gets NOTHING that touches user data: no S3,
+  # no S3 Files. It may call the broker, but the broker only answers to a
+  # valid user token.
+  # ------------------------------------------------------------------
+  RuntimeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-runtime-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*"
+      Policies:
+        - PolicyName: runtime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EcrPull
+                Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt EcrRepository.Arn
+              - Sid: EcrToken
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+              - Sid: LogGroups
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+              - Sid: Traces
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: "*"
+              - Sid: Metrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: bedrock-agentcore
+              - Sid: InvokeModel
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - "arn:aws:bedrock:*::foundation-model/*"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+              - Sid: WorkloadIdentity
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessToken
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                  - bedrock-agentcore:GetWorkloadAccessTokenForUserId
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/${RuntimeName}-*"
+              - Sid: InvokeBrokerOnly
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-broker"
+
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AWS::StackName}-agent"
+      EmptyOnDelete: true
+
+  # ------------------------------------------------------------------
+  # AgentCore Runtime (created once ImageUri is set).
+  # - JWT authorizer: only tokens from this user pool/client get in.
+  # - Authorization is allow-listed so the in-container gateway can hand
+  #   the user's token to the broker (it is stripped before the agent).
+  # ------------------------------------------------------------------
+  AgentRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Condition: HasImage
+    Properties:
+      AgentRuntimeName: !Ref RuntimeName
+      Description: Per-user S3 Files isolation reference agent
+      # V2 = SnapStart: the microVM is snapshotted after /ping turns healthy
+      # and every new session restores from it (default is V1).
+      PlatformVersion: V2
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Ref ImageUri
+      RoleArn: !GetAtt RuntimeExecutionRole.Arn
+      NetworkConfiguration:
+        NetworkMode: VPC
+        NetworkModeConfig:
+          SecurityGroups: [!Ref SecurityGroup]
+          Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      ProtocolConfiguration: HTTP
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/openid-configuration"
+          AllowedClients: [!Ref UserPoolClient]
+      RequestHeaderConfiguration:
+        RequestHeaderAllowlist: [Authorization]
+      EnvironmentVariables:
+        BROKER_FUNCTION: !Sub "${AWS::StackName}-broker"
+        MODEL_ID: !Ref ModelId
+        AGENT_UID: !Ref PosixUid
+        DATA_BUCKET: !Ref DataBucket
+        AWS_DEFAULT_REGION: !Ref AWS::Region
+    DependsOn: [MountTargetA, MountTargetB]
+
+  # ------------------------------------------------------------------
+  # Frontend: private S3 bucket behind CloudFront (OAC). No public bucket.
+  # ------------------------------------------------------------------
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  FrontendOac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AWS::StackName} web"
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: s3
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref FrontendOac
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: s3
+          ViewerProtocolPolicy: redirect-to-https
+          # Managed-CachingDisabled: redeploys show up without invalidation
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudFrontOacRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}"
+
+Outputs:
+  FileSystemId:
+    Value: !GetAtt S3FileSystem.FileSystemId
+  DataBucketName:
+    Value: !Ref DataBucket
+  SecurityGroupId:
+    Value: !Ref SecurityGroup
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  UserStorageTableName:
+    Value: !Ref UserStorageTable
+  BrokerRoleArn:
+    Value: !GetAtt BrokerRole.Arn
+  SessionMountRoleArn:
+    Value: !GetAtt SessionMountRole.Arn
+  RuntimeExecutionRoleArn:
+    Value: !GetAtt RuntimeExecutionRole.Arn
+  EcrRepositoryUri:
+    Value: !GetAtt EcrRepository.RepositoryUri
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  FrontendUrl:
+    Value: !Sub "https://${FrontendDistribution.DomainName}"
+  AgentRuntimeArn:
+    Condition: HasImage
+    Value: !GetAtt AgentRuntime.AgentRuntimeArn

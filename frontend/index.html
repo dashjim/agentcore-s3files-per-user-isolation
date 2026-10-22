@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentCore × S3 Files 按用户隔离存储 Demo</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Logged-out view -->
+  <section id="login-view" class="login-wrap" hidden>
+    <form id="login-form" class="card login-card">
+      <h1>AgentCore × S3 Files 按用户隔离存储 Demo</h1>
+      <p class="subtitle">Agent 运行在 AgentCore Runtime 中，每个用户只挂载自己的 S3 Files 访问点：文件跨会话持久保存，用户之间互不可见。</p>
+      <label>用户名<input id="login-username" autocomplete="username" required></label>
+      <label>密码<input id="login-password" type="password" autocomplete="current-password" required></label>
+      <button id="login-btn" type="submit" class="btn primary">登录</button>
+      <p id="login-error" class="error-text" hidden></p>
+    </form>
+  </section>
+
+  <!-- Logged-in view -->
+  <div id="app-view" class="app" hidden>
+    <header class="topbar">
+      <div class="brand">AgentCore × S3 Files <span>按用户隔离存储 Demo</span></div>
+      <div class="meta">
+        <span>用户 <b id="user-name"></b></span>
+        <span>会话 <code id="session-id"></code></span>
+      </div>
+      <div class="actions">
+        <button id="new-session-btn" class="btn">新会话（新 microVM）</button>
+        <button id="sidebar-toggle" class="btn">☁️ S3 存储</button>
+        <button id="logout-btn" class="btn ghost">退出</button>
+      </div>
+    </header>
+
+    <div class="layout">
+      <main class="chat">
+        <div id="messages" class="messages"></div>
+        <div id="suggestions" class="suggestions"></div>
+        <form id="chat-form" class="composer">
+          <textarea id="chat-input" rows="2" placeholder="让 agent 在 /mnt/user 里读写文件…（Enter 发送，Shift+Enter 换行）"></textarea>
+          <button id="send-btn" type="submit" class="btn primary">发送</button>
+        </form>
+      </main>
+
+      <aside id="sidebar" class="sidebar">
+        <div class="sidebar-head">
+          <h2>我的 S3 存储（/mnt/user）</h2>
+          <button id="sidebar-close" class="icon-btn" title="收起">×</button>
+        </div>
+
+        <section class="panel">
+          <h3>挂载与凭证</h3>
+          <div id="mount-progress" class="progress" hidden><span class="spinner"></span><span id="mount-progress-text"></span></div>
+          <p id="mount-done" class="ok-text" hidden></p>
+          <dl class="kv">
+            <dt>挂载点</dt><dd id="st-mount">—</dd>
+            <dt>S3 位置</dt>
+            <dd class="mono-row"><code id="st-s3prefix" class="ellipsis">—</code><button id="copy-s3-btn" class="icon-btn" title="复制">⧉</button></dd>
+            <dt>用户映射</dt><dd><span id="st-mapping">—</span></dd>
+            <dt>Access Point</dt><dd><code id="st-ap">—</code></dd>
+            <dt>文件系统</dt><dd><code id="st-fs">—</code></dd>
+            <dt>Agent 运行身份</dt><dd id="st-uid">—</dd>
+            <dt>STS AccessKeyId</dt><dd><code id="st-akid">—</code></dd>
+            <dt>过期时间</dt><dd><span id="st-exp">—</span> <span id="st-countdown" class="countdown"></span></dd>
+            <dt>已轮换次数</dt><dd id="st-rotations">—</dd>
+            <dt>上次轮换</dt><dd id="st-last-rotation">—</dd>
+          </dl>
+          <p id="st-error" class="error-text" hidden></p>
+          <button id="rotate-btn" class="btn">立即轮换 STS 凭证</button>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h3>文件</h3>
+            <button id="refresh-files-btn" class="btn small">刷新</button>
+          </div>
+          <ul id="file-list" class="file-list"></ul>
+          <p id="files-empty" class="muted" hidden>工作区还没有文件，让 agent 写一个试试</p>
+        </section>
+      </aside>
+    </div>
+  </div>
+
+  <!-- File preview -->
+  <div id="preview-modal" class="modal" hidden>
+    <div class="modal-card">
+      <div class="modal-head"><code id="preview-path"></code><button id="preview-close" class="icon-btn" title="关闭">×</button></div>
+      <pre id="preview-content"></pre>
+    </div>
+  </div>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

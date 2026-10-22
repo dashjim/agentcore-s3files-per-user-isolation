@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>AgentCore Runtime × S3 Files：按用户隔离的持久化存储（参考架构）</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 1920px; height: 1080px; overflow: hidden; }
+  body {
+    position: relative;
+    background: #f6f8fb;
+    font-family: "Noto Sans CJK SC", "Noto Sans", sans-serif;
+    font-size: 18px; line-height: 1.5; color: #232f3e;
+  }
+  .abs { position: absolute; }
+  .title {
+    left: 25px; top: 18px; width: 1200px; height: 58px;
+    display: flex; align-items: center; gap: 16px;
+  }
+  .title .bar { width: 8px; height: 44px; background: #ff9900; border-radius: 4px; flex: none; }
+  .title h1 { font-size: 34px; font-weight: 700; color: #232f3e; letter-spacing: 0.5px; white-space: nowrap; }
+
+  .box {
+    position: absolute; border: 2px solid #8d99a8; border-radius: 12px;
+    background: #fff; padding: 12px 16px; display: flex; flex-direction: column;
+  }
+  .hd { display: flex; align-items: center; gap: 12px; }
+  .ic {
+    flex: none; width: 46px; height: 46px; border-radius: 8px; color: #fff;
+    font-size: 20px; font-weight: 700; display: flex; align-items: center; justify-content: center;
+  }
+  .t { font-size: 22px; font-weight: 700; color: #232f3e; }
+  .t2 { font-size: 20px; font-weight: 700; color: #232f3e; }
+  .s { font-size: 18px; color: #3d4a5c; }
+  .mono { font-family: "Noto Sans Mono CJK SC", monospace; }
+  .center { justify-content: center; }
+
+  /* groups */
+  .runtime { background: #eef5fc; border: 2.5px solid #2e73b8; padding: 10px 20px; }
+  .runtime .t { color: #1d4f85; font-size: 24px; }
+  .vm { background: #ffffff; border: 2.5px dashed #7b8794; padding: 6px 16px; }
+  .vm .t2 { color: #4b5563; }
+
+  .c-browser { background: #f2f4f6; border-color: #545b64; }
+  .c-sec { background: #fdeef1; border-color: #dd344c; }
+  .c-lambda { background: #fff4e5; border-color: #ed7100; }
+  .c-store { background: #edf7ea; border-color: #3f8624; }
+  .c-db { background: #eef1fb; border-color: #3b48cc; }
+  .c-ml { background: #e7f7f3; border-color: #01a88d; }
+  .c-gw { background: #fff7e9; border-color: #ff9900; border-width: 2.5px; }
+  .c-root { background: #f1f3f6; border-color: #5a6b7f; }
+  .c-cred { background: #fdeef1; border-color: #dd344c; border-style: dashed; }
+  .c-agent { background: #eaf3fb; border-color: #2e73b8; }
+  .c-admin { background: #f3effc; border-color: #7a4fd0; border-style: dashed; border-width: 2.5px; }
+
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .chip {
+    font-size: 18px; padding: 3px 10px; border-radius: 14px;
+    background: #ffffff; border: 1.5px solid #f0b866; color: #5a3a00;
+  }
+  .step {
+    display: flex; align-items: center; background: #fff; border: 1.5px solid #f3c48a;
+    border-radius: 8px; padding: 0 12px; height: 42px; font-size: 19px; color: #3d2a10;
+  }
+  .note {
+    margin-top: 8px; background: #fff; border: 1.5px dashed #dd344c; border-radius: 8px;
+    padding: 5px 10px; font-size: 18px; color: #8a1c2c;
+  }
+  .ap {
+    margin-top: 8px; background: #fff; border: 1.5px solid #6aa84f; border-radius: 8px;
+    padding: 5px 10px; font-size: 18px; color: #234d16;
+  }
+
+  .lbl { position: absolute; font-size: 18px; line-height: 27px; color: #232f3e; }
+  .lbl.r { text-align: right; }
+  .lbl.g { color: #2d6a1a; }
+  .lbl.o { color: #b35300; }
+  .lbl.p { color: #5b35a8; }
+  .badge {
+    position: absolute; width: 34px; height: 34px; border-radius: 50%;
+    background: #d13212; color: #fff; font-size: 19px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 0 0 3px #ffffff; z-index: 5;
+  }
+
+  svg.wires { position: absolute; left: 0; top: 0; z-index: 2; pointer-events: none; }
+  .lbl, .box { z-index: 1; }
+  .lbl { z-index: 3; }
+
+  .legend {
+    background: #ffffff; border: 2px solid #c9d1db; padding: 6px 16px;
+    display: grid; grid-template-columns: auto auto; column-gap: 28px; row-gap: 0; align-content: center;
+  }
+  .lg { display: flex; align-items: center; gap: 10px; font-size: 18px; white-space: nowrap; }
+  .lg svg { flex: none; }
+
+  .strip {
+    left: 25px; top: 950px; width: 1870px; height: 110px;
+    background: #232f3e; border-radius: 14px; padding: 12px 20px;
+    display: flex; align-items: center; gap: 16px;
+  }
+  .strip .k { flex: none; font-size: 26px; font-weight: 700; color: #ff9900; }
+  .pill {
+    flex: 1 1 0; height: 86px; background: #ffffff; border-radius: 12px;
+    border-left: 8px solid #ff9900; padding: 6px 14px;
+    display: flex; align-items: center; font-size: 20px; font-weight: 500; color: #232f3e;
+  }
+</style>
+</head>
+<body>
+
+<div class="abs title"><div class="bar"></div><h1>AgentCore Runtime × S3 Files：按用户隔离的持久化存储（参考架构）</h1></div>
+
+<div class="box legend" style="left:1265px; top:12px; width:630px; height:74px;">
+  <div class="lg"><svg width="44" height="14"><line x1="2" y1="7" x2="34" y2="7" stroke="#232f3e" stroke-width="3"/><path d="M32 2 L42 7 L32 12 Z" fill="#232f3e"/></svg>控制 / 调用</div>
+  <div class="lg"><svg width="44" height="14"><line x1="2" y1="7" x2="34" y2="7" stroke="#ed7100" stroke-width="3" stroke-dasharray="7 5"/><path d="M32 2 L42 7 L32 12 Z" fill="#ed7100"/></svg>后台凭证轮换</div>
+  <div class="lg"><svg width="44" height="14"><line x1="2" y1="7" x2="34" y2="7" stroke="#3f8624" stroke-width="3"/><path d="M32 2 L42 7 L32 12 Z" fill="#3f8624"/></svg>数据读写</div>
+  <div class="lg"><svg width="44" height="14"><line x1="2" y1="7" x2="34" y2="7" stroke="#7a4fd0" stroke-width="3" stroke-dasharray="4 4"/><path d="M32 2 L42 7 L32 12 Z" fill="#7a4fd0"/></svg>开户（管理员，VM 之外）</div>
+</div>
+
+<!-- ========== Column A ========== -->
+<div class="box c-browser center" style="left:25px; top:110px; width:260px; height:170px;">
+  <div class="hd"><div class="ic" style="background:#545b64;">WEB</div><div class="t">浏览器（用户）</div></div>
+  <div class="s" style="margin-top:10px;">CloudFront + S3 静态页面</div>
+</div>
+
+<div class="box c-sec center" style="left:25px; top:340px; width:260px; height:160px;">
+  <div class="hd"><div class="ic" style="background:#dd344c;">ID</div><div class="t2">Amazon Cognito 用户池</div></div>
+  <div class="s" style="margin-top:8px;">登录，签发<br>access token (JWT)</div>
+</div>
+
+<div class="box c-ml center" style="left:70px; top:548px; width:215px; height:140px; border-left-width:8px;">
+  <div class="t2">Amazon Bedrock</div>
+  <div class="s" style="margin-top:4px;">Claude 模型</div>
+</div>
+
+<div class="box c-admin center" style="left:25px; top:820px; width:540px; height:115px;">
+  <div class="hd"><div class="ic" style="background:#7a4fd0; width:58px; font-size:19px;">ADM</div><div class="t2">开户控制面（模拟上游开户系统）</div></div>
+  <div class="s" style="margin-top:6px;"><span class="mono">scripts/manage_users.py</span>：add / disable / remove</div>
+</div>
+
+<!-- ========== AgentCore Runtime ========== -->
+<div class="box runtime" style="left:435px; top:95px; width:660px; height:715px;">
+  <div class="t">AgentCore Runtime</div>
+  <div class="s">PlatformVersion V2 · VPC 模式 · JWT 授权器</div>
+</div>
+
+<div class="box vm" style="left:455px; top:175px; width:620px; height:620px;">
+  <div class="t2">microVM（每个 session 一台）</div>
+</div>
+
+<div class="box c-gw" style="left:475px; top:222px; width:580px; height:130px; justify-content:center;">
+  <div class="t2">gateway（root，:8080）</div>
+  <div class="chips">
+    <div class="chip">申请/轮换 STS 凭证</div>
+    <div class="chip mono">mount -t s3files</div>
+    <div class="chip">绑定用户</div>
+  </div>
+</div>
+
+<div class="box c-root center" style="left:720px; top:372px; width:295px; height:80px; padding:6px 14px;">
+  <div class="t2" style="font-size:19px;">efs watchdog（root）</div>
+  <div class="s">用轮换后的凭证续签 TLS</div>
+</div>
+
+<div class="box c-cred center" style="left:720px; top:462px; width:295px; height:80px; padding:6px 14px;">
+  <div class="t2 mono" style="font-size:18px;">/root/.aws/credentials</div>
+  <div class="s">（0600，仅 root）</div>
+</div>
+
+<div class="box c-agent center" style="left:475px; top:565px; width:540px; height:105px;">
+  <div class="t2">agent（uid 1000，非 root，NoNewPrivs）</div>
+  <div class="s" style="margin-top:4px;">Strands Agent + 文件/命令工具</div>
+</div>
+
+<div class="box c-store center" style="left:475px; top:706px; width:540px; height:64px;">
+  <div class="t2"><span class="mono">/mnt/user</span> ← 该用户的 Access Point</div>
+</div>
+
+<!-- ========== Column C ========== -->
+<div class="box c-lambda" style="left:1265px; top:100px; width:630px; height:226px; gap:6px; justify-content:center;">
+  <div class="hd"><div class="ic" style="background:#ed7100; font-size:26px;">λ</div><div class="t">broker Lambda（VM 之外）</div></div>
+  <div class="step">① 校验 Cognito token</div>
+  <div class="step">② 查映射表：用户 → AP（查不到 / 已停用即拒绝）</div>
+  <div class="step">③ AssumeRole + 会话策略：只允许挂这一个 AP（≤1h）</div>
+</div>
+
+<div class="box c-sec center" style="left:1265px; top:384px; width:285px; height:136px; padding:12px 14px;">
+  <div class="hd" style="gap:10px;"><div class="ic" style="background:#dd344c; width:52px; font-size:19px;">STS</div><div class="t2">SessionMountRole</div></div>
+  <div class="s" style="margin-top:6px;">（只有 broker 能 assume）</div>
+</div>
+
+<div class="box c-db center" style="left:1575px; top:384px; width:285px; height:136px; padding:10px 12px;">
+  <div class="hd" style="gap:10px;"><div class="ic" style="background:#3b48cc; width:52px; font-size:19px;">DDB</div><div class="t2">DynamoDB 映射表</div></div>
+  <div class="s" style="margin-top:4px;">sub → userKey、AP、<br>rootPath、status</div>
+</div>
+
+<div class="box c-store" style="left:1265px; top:555px; width:335px; height:260px; justify-content:center;">
+  <div class="hd"><div class="ic" style="background:#3f8624;">FS</div><div class="t2">S3 Files 文件系统</div></div>
+  <div class="note">文件系统策略：<br>Deny 不经 AP 的挂载</div>
+  <div class="ap">AP alice → <span class="mono">/users/&lt;a&gt;</span></div>
+  <div class="ap">AP bob → <span class="mono">/users/&lt;b&gt;</span></div>
+</div>
+
+<div class="box c-store" style="left:1650px; top:555px; width:210px; height:260px; justify-content:center; padding:12px 14px;">
+  <div class="hd"><div class="ic" style="background:#3f8624;">S3</div><div class="t2">Amazon S3</div></div>
+  <div class="t2" style="margin-top:6px;">自有数据桶</div>
+  <div class="ap" style="margin-top:10px;">users/<br>&lt;sha256(sub)&gt;/...</div>
+</div>
+
+<!-- ========== Wires ========== -->
+<svg class="wires" width="1920" height="1080" viewBox="0 0 1920 1080">
+  <defs>
+    <marker id="aN" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L12,6 L0,12 Z" fill="#232f3e"/></marker>
+    <marker id="aNs" markerWidth="12" markerHeight="12" refX="2" refY="6" orient="auto" markerUnits="userSpaceOnUse"><path d="M12,0 L0,6 L12,12 Z" fill="#232f3e"/></marker>
+    <marker id="aG" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L12,6 L0,12 Z" fill="#3f8624"/></marker>
+    <marker id="aGs" markerWidth="12" markerHeight="12" refX="2" refY="6" orient="auto" markerUnits="userSpaceOnUse"><path d="M12,0 L0,6 L12,12 Z" fill="#3f8624"/></marker>
+    <marker id="aO" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L12,6 L0,12 Z" fill="#ed7100"/></marker>
+    <marker id="aP" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L12,6 L0,12 Z" fill="#7a4fd0"/></marker>
+  </defs>
+  <g fill="none" stroke-width="3">
+    <!-- 1 browser -> cognito -->
+    <path d="M155 280 L155 338" stroke="#232f3e" marker-end="url(#aN)"/>
+    <!-- 2 browser -> gateway -->
+    <path d="M285 265 L473 265" stroke="#232f3e" marker-end="url(#aN)"/>
+    <!-- 3 gateway -> broker -->
+    <path d="M1055 250 L1263 250" stroke="#232f3e" marker-end="url(#aN)"/>
+    <!-- 8 gateway -> broker (dashed) -->
+    <path d="M1055 320 L1263 320" stroke="#ed7100" stroke-dasharray="10 7" marker-end="url(#aO)"/>
+    <!-- 4 broker <-> role -->
+    <path d="M1330 328 L1330 382" stroke="#232f3e" marker-start="url(#aNs)" marker-end="url(#aN)"/>
+    <!-- broker -> DynamoDB (GetItem) -->
+    <path d="M1640 326 L1640 382" stroke="#232f3e" marker-end="url(#aN)"/>
+    <!-- 5 gateway -> S3 Files (mount) -->
+    <path d="M1035 352 L1035 610 L1263 610" stroke="#232f3e" marker-end="url(#aN)"/>
+    <!-- 6 gateway -> agent -->
+    <path d="M500 352 L500 563" stroke="#232f3e" marker-end="url(#aN)"/>
+    <!-- 7 agent <-> /mnt/user <-> S3 Files <-> S3 -->
+    <path d="M745 672 L745 704" stroke="#3f8624" marker-start="url(#aGs)" marker-end="url(#aG)"/>
+    <path d="M1017 738 L1263 738" stroke="#3f8624" marker-start="url(#aGs)" marker-end="url(#aG)"/>
+    <path d="M1602 685 L1648 685" stroke="#3f8624" marker-start="url(#aGs)" marker-end="url(#aG)"/>
+    <!-- agent -> bedrock -->
+    <path d="M475 617 L287 617" stroke="#232f3e" marker-end="url(#aN)"/>
+  </g>
+  <g fill="none" stroke="#7a4fd0" stroke-width="3" stroke-dasharray="6 5">
+    <!-- 0 admin -> Cognito -->
+    <path d="M45 820 L45 502" marker-end="url(#aP)"/>
+    <!-- 0 admin -> S3 Files (CreateAccessPoint) -->
+    <path d="M565 850 L1430 850 L1430 817" marker-end="url(#aP)"/>
+    <!-- 0 admin -> DynamoDB (write mapping) -->
+    <path d="M565 905 L1880 905 L1880 452 L1862 452" marker-end="url(#aP)"/>
+  </g>
+</svg>
+
+<!-- ========== Labels ========== -->
+<div class="lbl" style="left:182px; top:296px; width:80px;">登录</div>
+<div class="lbl" style="left:296px; top:286px; width:132px;">Bearer token<br>+ Session-Id<br>JWT 授权器校验</div>
+<div class="lbl" style="left:1104px; top:176px; width:156px;">lambda:Invoke<br>携带用户 token</div>
+<div class="lbl o" style="left:1104px; top:344px; width:156px;">过期前 15 min<br>轮换凭证<br>原地改写 profile<br>watchdog 续签</div>
+<div class="lbl" style="left:1356px; top:328px; width:226px;">AssumeRole + 会话策略<br>返回 1h STS 凭证</div>
+<div class="lbl" style="left:1658px; top:341px; width:200px;">GetItem（只读）</div>
+<div class="lbl" style="left:1104px; top:504px; width:156px;">mount<br>TLS + IAM<br>nodirects3read</div>
+<div class="lbl" style="left:522px; top:420px; width:185px;">转发请求<br>去掉 Authorization</div>
+<div class="lbl g" style="left:1104px; top:662px; width:156px;">读写文件<br>持久化到 S3</div>
+<div class="lbl" style="left:300px; top:584px; width:126px;">InvokeModel</div>
+<div class="lbl p" style="left:72px; top:722px; width:90px;">建用户</div>
+<div class="lbl p" style="left:600px; top:818px; width:520px;">CreateAccessPoint <span class="mono">/users/&lt;sha256(sub)&gt;</span>，0700</div>
+<div class="lbl p" style="left:600px; top:872px; width:120px;">写映射</div>
+
+<!-- ========== Badges ========== -->
+<div class="badge" style="left:28px; top:718px;">0</div>
+<div class="badge" style="left:1163px; top:833px;">0</div>
+<div class="badge" style="left:1163px; top:888px;">0</div>
+<div class="badge" style="left:138px; top:292px;">1</div>
+<div class="badge" style="left:343px; top:248px;">2</div>
+<div class="badge" style="left:1163px; top:233px;">3</div>
+<div class="badge" style="left:1313px; top:338px;">4</div>
+<div class="badge" style="left:1163px; top:593px;">5</div>
+<div class="badge" style="left:483px; top:395px;">6</div>
+<div class="badge" style="left:1163px; top:721px;">7</div>
+<div class="badge" style="left:1163px; top:303px;">8</div>
+
+<!-- ========== Bottom strip ========== -->
+<div class="abs strip">
+  <div class="k">隔离靠四层：</div>
+  <div class="pill" style="flex-grow:1; white-space:nowrap;">① 会话策略：凭证只能挂本用户 AP</div>
+  <div class="pill" style="flex-grow:1.2; white-space:nowrap;">② 文件系统策略：Deny 不经 AP 的挂载</div>
+  <div class="pill" style="flex-grow:0.95; white-space:nowrap;">③ 执行角色零 S3 / S3 Files 权限</div>
+  <div class="pill" style="flex-grow:1.15;">④ agent 非 root：<br>读不到凭证、不能 mount、绑定单一用户</div>
+</div>
+
+</body>
+</html>
